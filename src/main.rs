@@ -13,14 +13,16 @@ use std::time::Duration;
 use ansi_term::Color::{Red, Yellow};
 use anyhow::{bail, ensure, Context, Error};
 use clap::{crate_version, Parser};
+use http::{
+    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH},
+    StatusCode,
+};
 use pbr::{ProgressBar, Units};
 use remove_dir_all::remove_dir_all;
-use reqwest::blocking::{Client, ClientBuilder};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_LENGTH, USER_AGENT};
-use reqwest::{Proxy, StatusCode};
 use tar::Archive;
 use tee::TeeReader;
 use tempfile::{tempdir, tempdir_in};
+use ureq::Agent;
 use xz2::read::XzDecoder;
 
 static SUPPORTED_CHANNELS: &[&str] = &["nightly", "beta", "stable"];
@@ -111,7 +113,7 @@ struct Args {
 }
 
 fn download_tar_xz(
-    client: Option<&Client>,
+    client: Option<&Agent>,
     url: &str,
     dest: &Path,
     commit: &str,
@@ -121,9 +123,9 @@ fn download_tar_xz(
 ) -> Result<(), Error> {
     eprintln!("downloading <{}>...", url);
     if let Some(client) = client {
-        let response = client.get(url).send()?;
+        let response = client.get(url).call()?;
 
-        match response.status() {
+        match StatusCode::from_u16(response.status())? {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND => bail!(
                 "missing component `{}` on toolchain `{}` on channel `{}` for target `{}`",
@@ -136,9 +138,7 @@ fn download_tar_xz(
         };
 
         let length = response
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|h| h.to_str().ok())
+            .header(CONTENT_LENGTH.as_str())
             .and_then(|h| h.parse().ok())
             .unwrap_or(0);
 
@@ -148,7 +148,7 @@ fn download_tar_xz(
         progress_bar.set_units(Units::Bytes);
         progress_bar.set_max_refresh_rate(Some(Duration::from_secs(1)));
 
-        let response = TeeReader::new(response, &mut progress_bar);
+        let response = TeeReader::new(response.into_reader(), &mut progress_bar);
         let response = XzDecoder::new(response);
         for entry in Archive::new(response).entries()? {
             let mut entry = entry?;
@@ -207,8 +207,8 @@ struct Toolchain<'a> {
 }
 
 fn install_single_toolchain(
-    client: &Client,
-    maybe_dry_client: Option<&Client>,
+    client: &Agent,
+    maybe_dry_client: Option<&Agent>,
     prefix: &str,
     toolchains_path: &Path,
     toolchain: &Toolchain<'_>,
@@ -293,7 +293,7 @@ fn install_single_toolchain(
     Ok(())
 }
 
-fn fetch_master_commit(client: &Client, github_token: Option<&str>) -> Result<String, Error> {
+fn fetch_master_commit(client: &Agent, github_token: Option<&str>) -> Result<String, Error> {
     eprintln!("fetching master commit hash... ");
     fetch_master_commit_via_git()
         .context("unable to fetch master commit via git, falling back to HTTP")
@@ -325,23 +325,21 @@ fn fetch_master_commit_via_git() -> Result<String, Error> {
 }
 
 fn fetch_master_commit_via_http(
-    client: &Client,
+    client: &Agent,
     github_token: Option<&str>,
 ) -> Result<String, Error> {
     static URL: &str = "https://api.github.com/repos/rust-lang/rust/commits/master";
     static MEDIA_TYPE: &str = "application/vnd.github.VERSION.sha";
-    let mut req = client.get(URL).header(ACCEPT, MEDIA_TYPE);
+    let mut req = client.get(URL).set(ACCEPT.as_str(), MEDIA_TYPE);
     if let Some(token) = github_token {
-        req = req.header(AUTHORIZATION, format!("token {}", token));
+        req = req.set(AUTHORIZATION.as_str(), &format!("token {}", token));
     }
-    let response = req.send()?;
-    match response.status() {
+    let response = req.call()?;
+    match StatusCode::from_u16(response.status())? {
         StatusCode::OK => {}
         status @ StatusCode::FORBIDDEN => {
             let rate_limit = response
-                .headers()
-                .get("X-RateLimit-Remaining")
-                .and_then(|r| r.to_str().ok())
+                .header("X-RateLimit-Remaining")
                 .and_then(|r| r.parse::<u32>().ok())
                 .unwrap_or(0);
             if rate_limit == 0 {
@@ -352,7 +350,7 @@ fn fetch_master_commit_via_http(
         }
         status => bail!("received status {} for URL {}", status, URL),
     }
-    let master_commit = response.text()?;
+    let master_commit = response.into_string()?;
     if master_commit.len() == 40
         && master_commit
             .chars()
@@ -369,14 +367,14 @@ fn fetch_master_commit_via_http(
     }
 }
 
-fn get_channel(client: &Client, prefix: &str, commit: &str) -> Result<&'static str, Error> {
+fn get_channel(client: &Agent, prefix: &str, commit: &str) -> Result<&'static str, Error> {
     eprintln!("detecting the channel of the `{}` toolchain...", commit);
 
     for channel in SUPPORTED_CHANNELS {
         let url = format!("{}/{}/rust-src-{}.tar.xz", prefix, commit, channel);
-        let resp = client.head(&url).send()?;
+        let resp = client.head(&url).call()?;
 
-        match resp.status() {
+        match StatusCode::from_u16(resp.status())? {
             StatusCode::OK => return Ok(channel),
             StatusCode::NOT_FOUND | StatusCode::FORBIDDEN => {}
             status => bail!("unexpected status code {} for HEAD {}", status, url),
@@ -389,17 +387,12 @@ fn get_channel(client: &Client, prefix: &str, commit: &str) -> Result<&'static s
 fn run() -> Result<(), Error> {
     let mut args = Args::parse();
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_static("rustup-toolchain-install-master"),
-    );
-
-    let mut client_builder = ClientBuilder::new().default_headers(headers);
+    let mut agent_builder = ureq::builder().user_agent("rustup-toolchain-install-master");
     if let Some(proxy) = args.proxy {
-        client_builder = client_builder.proxy(Proxy::all(&proxy)?);
+        let proxy = ureq::Proxy::new(proxy)?;
+        agent_builder = agent_builder.proxy(proxy);
     }
-    let client = client_builder.build()?;
+    let client = agent_builder.build();
 
     let rustup_home = home::rustup_home().expect("$RUSTUP_HOME is undefined?");
     let toolchains_path = rustup_home.join("toolchains");
